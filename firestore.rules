@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function signed() { return request.auth != null; }
+    function hasProfile() { return signed() && exists(/databases/$(db)/documents/users/$(request.auth.uid)); }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+
+    // Pierwsze uruchomienie bazy danych: pozwala utworzyć pierwsze konto administratora
+    function isUninitialized() {
+      return !exists(/databases/$(db)/documents/config/initialized);
+    }
+
+    // Administrator = konto kadry z uprawnieniami administratora lub rola admin
+    function admin() {
+      return hasProfile() && (
+        me().get('admin', false) == true ||
+        me().get('rola', '') in ['admin', 'Admin'] ||
+        (me().get('rola', '') in ['kadra', 'Kadra'] && me().get('admin', false) == true)
+      );
+    }
+
+    // Kadra = członkowie kadry lub administratorzy
+    function kadra() {
+      return hasProfile() && (
+        admin() ||
+        me().get('rola', '') in ['kadra', 'Kadra', 'admin', 'Admin'] ||
+        me().get('grupa', '') in ['kadra', 'Kadra', 'admin', 'Admin'] ||
+        me().get('admin', false) == true
+      );
+    }
+
+    function zastepowy() { return hasProfile() && me().rola == 'zastepowy'; }
+    function szeregowy() { return hasProfile() && me().rola == 'szeregowy'; }
+    function mojZastep() { return hasProfile() && me().get('zastep', '') != ''; }
+    function alarm(id) { return get(/databases/$(db)/documents/alarmy/$(id)).data; }
+    function aktywny(aid) { return request.time.toMillis() >= alarm(aid).startMs && request.time.toMillis() < alarm(aid).startMs + 86400000; }
+    function zMojegoZastepu(uid) { return get(/databases/$(db)/documents/users/$(uid)).data.zastep == me().zastep; }
+
+    // Konfiguracja punktacji i systemu: odczyt dla każdego, zmiana przez kadrę lub podczas inicjalizacji
+    match /config/{d} {
+      allow read: if true;
+      allow write: if kadra() || (signed() && isUninitialized());
+    }
+
+    // Konta użytkowników:
+    // - Czytanie: własne konto, kadra widzi wszystkich, zastępowy widzi swój zastęp
+    // - Tworzenie: administrator, pierwszy użytkownik (bootstrap) lub samodzielnie (bez uprawnień kadry/admina)
+    // - Modyfikacja: administrator może zarządzać; kadra może zmieniać rolę i zastęp harcerzom
+    // - Usuwanie: tylko administrator
+    match /users/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || kadra() || (zastepowy() && resource.data.zastep == me().zastep));
+      allow create: if admin()
+        || (signed() && request.auth.uid == uid && isUninitialized())
+        || (signed() && request.auth.uid == uid && !(request.resource.data.get('admin', false) == true || request.resource.data.get('rola', '') in ['kadra', 'Kadra', 'admin', 'Admin']));
+      allow update: if (admin() && (uid != request.auth.uid ||
+          (request.resource.data.rola == resource.data.rola && request.resource.data.get('admin', false) == resource.data.get('admin', false))))
+        || (kadra() && uid != request.auth.uid && resource.data.get('admin', false) != true
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rola', 'zastep'])
+          && request.resource.data.rola in ['szeregowy', 'zastepowy', 'kadra']);
+      allow delete: if admin() && uid != request.auth.uid;
+    }
+
+    // Mapowanie login -> uid/email
+    match /loginy/{login} {
+      allow get: if true;
+      allow list: if admin();
+      allow write: if admin() || (signed() && (request.resource.data.uid == request.auth.uid || isUninitialized()));
+    }
+
+    // Hasła: odczyt TYLKO dla administratora; zapis przez administratora lub użytkownika przy zmianie własnego hasła
+    match /sekrety/{uid} {
+      allow read: if admin();
+      allow write: if admin() || (signed() && (request.auth.uid == uid || isUninitialized()));
+    }
+
+    // Zbiórki zastępu: tworzy kadra lub zastępowy dla swojego zastępu ze statusem 'oczekuje'
+    match /zbiorkiZastepu/{id} {
+      allow read: if true;
+      allow create: if kadra() ||
+        (zastepowy() && request.resource.data.zastep == me().zastep && request.resource.data.status == 'oczekuje');
+      allow update: if kadra() ||
+        (zastepowy() && resource.data.zastep == me().zastep && resource.data.status == 'oczekuje'
+          && request.resource.data.status == 'oczekuje' && request.resource.data.zastep == me().zastep);
+      allow delete: if kadra() ||
+        (zastepowy() && resource.data.zastep == me().zastep && resource.data.status == 'oczekuje');
+    }
+
+    // Akcje, korekty, archiwum: tylko kadra
+    match /akcje/{id}  { allow read: if true; allow write: if kadra(); }
+    match /korekty/{id} { allow read: if true; allow write: if kadra(); }
+    match /archiwum/{id} { allow read, write: if kadra(); }
+    match /alarmy/{id} { allow read: if true; allow write: if kadra(); }
+
+    // Meldunki z alarmów: kadra lub harcerz / zastępowy ze swojego zastępu
+    match /meldunki/{id} {
+      allow read: if true;
+      allow create: if kadra() || (mojZastep()
+        && id == request.resource.data.alarmId + '_' + request.resource.data.uid
+        && request.resource.data.zastep == me().zastep
+        && request.resource.data.status == 'oczekuje'
+        && request.resource.data.czas == request.time
+        && aktywny(request.resource.data.alarmId)
+        && (((szeregowy() || zastepowy()) && request.resource.data.uid == request.auth.uid)
+          || (zastepowy() && request.resource.data.zglosil == request.auth.uid && zMojegoZastepu(request.resource.data.uid))));
+      allow update: if kadra();
+      allow delete: if kadra() || (signed() && resource.data.status == 'oczekuje'
+        && (resource.data.uid == request.auth.uid || resource.data.get('zglosil', '') == request.auth.uid));
+    }
+
+    // Sprawności: wniosek składa harcerz lub zastępowy; kadra przyznaje
+    match /sprawnosci/{id} {
+      allow read: if true;
+      allow create: if kadra() || (mojZastep()
+        && request.resource.data.status == 'oczekuje'
+        && request.resource.data.zastep == me().zastep
+        && request.resource.data.gwiazdki in [1, 2, 3]
+        && request.resource.data.autor == request.auth.uid
+        && request.resource.data.utworzono == request.time
+        && (request.resource.data.get('caly', false) == false || zastepowy())
+        && (((szeregowy() || zastepowy()) && request.resource.data.uid == request.auth.uid)
+          || (zastepowy() && zMojegoZastepu(request.resource.data.uid))));
+      allow update: if kadra();
+      allow delete: if kadra() || (signed() && resource.data.status == 'oczekuje'
+        && (resource.data.uid == request.auth.uid || resource.data.autor == request.auth.uid));
+    }
+
+    // Zdjęcia: tylko autor zdjęcia lub zastępowy / kadra
+    match /zdjecia/{id} {
+      allow read: if kadra() || (signed() && (resource.data.uid == request.auth.uid || resource.data.get('zglosil', '') == request.auth.uid));
+      allow create, update: if signed() && id == request.resource.data.alarmId + '_' + request.resource.data.uid
+        && (request.resource.data.uid == request.auth.uid
+          || (zastepowy() && request.resource.data.zglosil == request.auth.uid && zMojegoZastepu(request.resource.data.uid)));
+      allow delete: if kadra() || (signed() && (resource.data.uid == request.auth.uid || resource.data.get('zglosil', '') == request.auth.uid));
+    }
+
+    // Kody QR: tworzy i usuwa TYLKO kadra; harcerz może wyłącznie zarejestrować swój skan
+    match /kodyQr/{id} {
+      allow read: if true;
+      allow create, delete: if kadra();
+      allow update: if kadra() || (signed() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['skanyCount', 'ostatniSkan', 'ostatniSkanKto']));
+    }
+
+    // Rejestr skanów kodów QR:
+    // - Czytanie: kadra widzi wszystkie skany; harcerz widzi TYLKO swoje własne skany
+    // - Tworzenie: zalogowany harcerz tworzy TYLKO swój własny wpis (uid musi zgadzać się z zalogowanym)
+    // - Modyfikacja i usuwanie: TYLKO kadra
+    match /skanyQr/{id} {
+      allow read: if kadra() || (signed() && resource.data.uid == request.auth.uid);
+      allow create: if signed() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if kadra();
+    }
+  }
+}

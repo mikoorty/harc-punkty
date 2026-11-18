@@ -1,0 +1,54 @@
+# Buduje aplikację Android (APK) i publikuje ją jako wydanie GitHub Releases.
+# Działa automatycznie na dowolnym forku!
+name: Aplikacja Android (APK)
+
+on:
+  push:
+    branches: [main]
+    paths: ["android/**", ".github/workflows/apk.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.10.2" }
+
+      - name: Konfiguracja adresu aplikacji pod obecne repozytorium
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          FULL="${{ github.repository }}"
+          START_URL="https://${OWNER}.github.io/${REPO}/"
+          VERSION_URL="${START_URL}apk_version.json"
+          GH_RELEASES="https://api.github.com/repos/${FULL}/releases/latest"
+          HOST="${OWNER}.github.io"
+          sed -i "s|https://mikoorty.github.io/harc-punkty/apk_version.json|${VERSION_URL}|g" android/app/src/main/java/pl/knieja/punkty/MainActivity.java
+          sed -i "s|https://api.github.com/repos/mikoorty/harc-punkty/releases/latest|${GH_RELEASES}|g" android/app/src/main/java/pl/knieja/punkty/MainActivity.java
+          sed -i "s|https://mikoorty.github.io/harc-punkty/|${START_URL}|g" android/app/src/main/java/pl/knieja/punkty/MainActivity.java
+          sed -i "s|mikoorty.github.io|${HOST}|g" android/app/src/main/java/pl/knieja/punkty/MainActivity.java
+
+      - name: Klucz podpisu
+        env: { KS_B64: "${{ secrets.KS_B64 }}" }
+        run: |
+          if [ -n "$KS_B64" ]; then echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks";
+          else keytool -genkeypair -keystore "$RUNNER_TEMP/ks.jks" -storepass harcpunkty-apk -keypass harcpunkty-apk -alias harcpunkty -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=HarcPunkty"; fi
+
+      - name: Budowanie APK
+        env: { KS_PATH: "${{ runner.temp }}/ks.jks", KS_PASS: "harcpunkty-apk" }
+        run: gradle -p android assembleRelease -PversionCode=${{ github.run_number }} --no-daemon
+
+      - name: Publikacja wydania
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk HarcPunkty.apk
+          gh release create "apk-${{ github.run_number }}" HarcPunkty.apk --latest \
+            --title "HarcPunkty – aplikacja Android (wersja 1.${{ github.run_number }})" \
+            --notes "Pobierz HarcPunkty.apk na telefonie i zainstaluj (zezwól na instalację z tego źródła). Aplikacja otwiera https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
